@@ -338,36 +338,61 @@ function registerAgentSkillProviders(ctx: HostContext, invalidators: Set<() => v
 }
 
 /**
+ * 安全获取宿主或上下文服务对象。
+ * 优先调用无抛错的 get() 方法（Cordis 推荐无需 inject 的反射读取方式），
+ * 对直接属性访问做局部隔离，避免因未声明服务触发 Cordis 严格属性 Proxy 抛错而截断后续回退探测。
+ */
+function safeGetService<T = unknown>(target: unknown, name: string): T | undefined {
+  if (!target || typeof target !== "object") return undefined;
+  const targetObj = target as { get?: (key: string) => unknown; [key: string]: unknown };
+  if (typeof targetObj.get === "function") {
+    try {
+      const found = targetObj.get(name);
+      if (found !== undefined) return found as T;
+    } catch {}
+  }
+  try {
+    return targetObj[name] as T;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * 探测当前执行环境是否处于 danger-full-access 文件沙箱模式。
  * 当宿主已明确放开完全文件访问权限时，创建技能写入全局目录无需弹窗二次审批，
  * 同时避免在 approval=never（严格无人值守）模式下与宿主 fail-closed 策略产生死锁。
  */
 function isDangerFullAccess(ctx: HostContext, exec?: { agent?: unknown }): boolean {
   try {
-    const agent = exec?.agent as { session?: { id?: string }; ctx?: { get?: (name: string) => unknown; sandboxPolicy?: unknown; sessionProjections?: unknown } } | undefined;
+    const agent = exec?.agent as { session?: { header?: { cwd?: string; sandboxMode?: string; sandbox?: { mode?: string } }; id?: string }; ctx?: unknown } | undefined;
     const session = agent?.session;
-    const sandboxPolicy = (ctx.sandboxPolicy as { resolve?: (req: unknown) => { mode?: string } } | undefined)
-      || (typeof ctx.get === "function" ? (ctx.get("sandboxPolicy") as { resolve?: (req: unknown) => { mode?: string } } | undefined) : undefined)
-      || (agent?.ctx && typeof agent.ctx.get === "function" ? (agent.ctx.get("sandboxPolicy") as { resolve?: (req: unknown) => { mode?: string } } | undefined) : undefined)
-      || (agent?.ctx && (agent.ctx.sandboxPolicy as { resolve?: (req: unknown) => { mode?: string } } | undefined));
+    const sandboxPolicy = safeGetService<{ resolve?: (req: unknown) => { mode?: string } }>(ctx, "sandboxPolicy")
+      || safeGetService<{ resolve?: (req: unknown) => { mode?: string } }>(agent?.ctx, "sandboxPolicy");
 
     if (sandboxPolicy && typeof sandboxPolicy.resolve === "function") {
       const resolved = sandboxPolicy.resolve(session ? { session } : {});
       if (resolved?.mode === "danger-full-access") return true;
     }
 
-    const sessionProjections = (ctx.sessionProjections as { stateOf?: (session: unknown, key: string) => unknown } | undefined)
-      || (typeof ctx.get === "function" ? (ctx.get("sessionProjections") as { stateOf?: (session: unknown, key: string) => unknown } | undefined) : undefined)
-      || (agent?.ctx && typeof agent.ctx.get === "function" ? (agent.ctx.get("sessionProjections") as { stateOf?: (session: unknown, key: string) => unknown } | undefined) : undefined)
-      || (agent?.ctx && (agent.ctx.sessionProjections as { stateOf?: (session: unknown, key: string) => unknown } | undefined));
+    const sessionProjections = safeGetService<{ stateOf?: (session: unknown, key: string) => unknown }>(ctx, "sessionProjections")
+      || safeGetService<{ stateOf?: (session: unknown, key: string) => unknown }>(agent?.ctx, "sessionProjections");
 
     if (session && sessionProjections && typeof sessionProjections.stateOf === "function") {
       const mode = sessionProjections.stateOf(session, "sandboxMode");
       if (mode === "danger-full-access") return true;
     }
 
+    const header = session?.header;
+    if (header?.sandboxMode === "danger-full-access" || header?.sandbox?.mode === "danger-full-access") {
+      return true;
+    }
+
     return false;
-  } catch {
+  } catch (err) {
+    if (ctx.logger && typeof ctx.logger.warn === "function") {
+      ctx.logger.warn(`skills-manager: probe isDangerFullAccess failed: ${String(err)}`);
+    }
     return false;
   }
 }

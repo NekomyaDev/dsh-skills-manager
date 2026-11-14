@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.8] - 2026-11-14
+
+### Full File Access Mode Skill Creation Deadlock Fix
+
+- **Resolve skill creation rejection in Danger Full Access mode**: fixed an issue where AI attempts to create skills using the `create_skill` tool were automatically rejected and falsely reported as "user rejected" when running in full file access mode (`danger-full-access`).
+- **Prevent unattended mode deadlocks**: ensured skill creation tools can execute smoothly without unexpected approval interruptions when strict unattended policy (`approval: never`) is configured, eliminating deadlocks where the AI repeatedly asks the user for authorization (#92).
+
 ## [1.4.7] - 2026-11-14
 
 ### Repository Bulk Operations & Cancellation Support

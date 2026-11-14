@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { apply } from "../lib/index.js";
+import { apply, inject } from "../lib/index.js";
 
 // 测试 tools/pre-execute 钩子对 create_skill 的审批与沙箱策略感知
 
 let preExecuteHandler = null;
 let registeredTool = null;
 
-const fakeCtx = {
+const rawCtx = {
   effect(fn) {
     return fn();
   },
@@ -42,20 +42,35 @@ const fakeCtx = {
     },
   },
   get(name) {
-    if (name === "sandboxPolicy") return fakeCtx.sandboxPolicy;
-    if (name === "sessionProjections") return fakeCtx.sessionProjections;
+    if (name === "sandboxPolicy") return rawCtx.sandboxPolicy;
+    if (name === "sessionProjections") return rawCtx.sessionProjections;
     return undefined;
   },
 };
 
+const builtinContextProps = new Set(["effect", "on", "get", "logger", "emit"]);
+
+// 模拟严格的 Cordis Context Proxy：未声明在 inject 中的服务直接以属性读取时必定抛错
+const fakeCtx = new Proxy(rawCtx, {
+  get(target, prop, receiver) {
+    if (typeof prop === "string" && !builtinContextProps.has(prop)) {
+      if (!inject.includes(prop)) {
+        throw new Error(`cannot get property "${String(prop)}" without inject`);
+      }
+    }
+    return Reflect.get(target, prop, receiver);
+  },
+});
+
 apply(fakeCtx);
 
 assert.ok(preExecuteHandler, "tools/pre-execute 钩子必须被注册");
+assert.ok(!inject.includes("sandboxPolicy"), "sandboxPolicy 不作为全插件硬依赖注入，通过反射安全获取");
 
 // 用例 1：受限制沙箱（如 workspace-write）下调用 create_skill，必须返回 ask 请求审批
 {
   let nextCalled = false;
-  fakeCtx.sandboxPolicy = {
+  rawCtx.sandboxPolicy = {
     resolve() {
       return { mode: "workspace-write", workspaceRoot: "/workspace" };
     },
@@ -81,7 +96,7 @@ assert.ok(preExecuteHandler, "tools/pre-execute 钩子必须被注册");
 // 用例 2：danger-full-access 沙箱下调用 create_skill，必须直接放行（调用 next()）
 {
   let nextCalled = false;
-  fakeCtx.sandboxPolicy = {
+  rawCtx.sandboxPolicy = {
     resolve() {
       return { mode: "danger-full-access", workspaceRoot: "/workspace" };
     },
@@ -105,8 +120,8 @@ assert.ok(preExecuteHandler, "tools/pre-execute 钩子必须被注册");
 // 用例 3：通过 sessionProjections 识别到 danger-full-access
 {
   let nextCalled = false;
-  fakeCtx.sandboxPolicy = undefined;
-  fakeCtx.sessionProjections = {
+  rawCtx.sandboxPolicy = undefined;
+  rawCtx.sessionProjections = {
     stateOf(session, key) {
       if (key === "sandboxMode") return "danger-full-access";
       return undefined;
@@ -131,8 +146,8 @@ assert.ok(preExecuteHandler, "tools/pre-execute 钩子必须被注册");
 // 用例 4：服务均缺失（无 sandboxPolicy / 无 sessionProjections）时必须 fail-closed 拦截并返回 ask
 {
   let nextCalled = false;
-  fakeCtx.sandboxPolicy = undefined;
-  fakeCtx.sessionProjections = undefined;
+  rawCtx.sandboxPolicy = undefined;
+  rawCtx.sessionProjections = undefined;
   const exec = {
     name: "create_skill",
     arguments: { name: "test-skill-missing", description: "desc", body: "body" },
@@ -158,6 +173,30 @@ assert.ok(preExecuteHandler, "tools/pre-execute 钩子必须被注册");
   });
 
   assert.equal(nextCalled, true, "非 create_skill 工具必须直接放行");
+  assert.deepEqual(decision, { kind: "allow" });
+}
+
+// 用例 6：通过 session.header.sandboxMode 识别到 danger-full-access
+{
+  let nextCalled = false;
+  rawCtx.sandboxPolicy = undefined;
+  rawCtx.sessionProjections = undefined;
+  const exec = {
+    name: "create_skill",
+    arguments: { name: "test-skill-header", description: "desc", body: "body" },
+    agent: {
+      session: {
+        id: "s-header",
+        header: { sandboxMode: "danger-full-access" },
+      },
+    },
+  };
+  const decision = await preExecuteHandler(exec, () => {
+    nextCalled = true;
+    return Promise.resolve({ kind: "allow" });
+  });
+
+  assert.equal(nextCalled, true, "session.header.sandboxMode 为 danger-full-access 时必须放行");
   assert.deepEqual(decision, { kind: "allow" });
 }
 
